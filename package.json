@@ -1,0 +1,20 @@
+{
+  "name": "naruto-rpg-online",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Máy chủ Naruto RPG: tài khoản, lưu game, phòng chơi chung, đồng minh, chat (Socket.IO)",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.8.1"
+  },
+  "optionalDependencies": {
+    "mongodb": "^6.8.0"
+  }
+}
