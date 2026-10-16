@@ -15,7 +15,7 @@
   const reqs = new Map();               // id -> {name, ts}: lời mời đồng minh đang chờ
   const chatLog = [], hist = [];
   let sock = null, myId = null, myNick = '', lastRoom = null, entered = false, lock = null, view = 'main',
-      netpOpen = false, ioTries = 0, lastWhisper = '', sidc = 0, hi = -1, soloHinted = false, lastNet = '', lastSide = '';
+      netpOpen = false, ioTries = 0, lastWhisper = '', sidc = 0, lastScn = null, ownerId = null, snapN = 0, bsh = new Map(), hi = -1, soloHinted = false, lastNet = '', lastSide = '';
   const $q = id => document.getElementById(id);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } };
@@ -55,7 +55,7 @@
       auth: cb => cb({ token: N.tok(), guest: guest ? guestName() : '' }),
       transports: ['websocket', 'polling'], reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 8000,
     });
-    sock.on('connect', () => { N.on = true; myId = sock.id; status(); if (lastRoom && entered) rejoin(); });
+    sock.on('connect', () => { N.on = true; myId = sock.id; lastScn = null; ownerId = null; status(); if (lastRoom && entered) rejoin(); });
     sock.on('hello', d => { myId = d.id; myNick = d.name || myNick; });
     sock.on('connect_error', e => { N.on = false; status('Chưa kết nối được máy chủ' + (e && e.message ? ' (' + e.message + ')' : '') + ' — đang thử lại…', 1); });
     sock.on('disconnect', () => { N.on = false; status(); if (N.room && run) banner('⚠ Mất kết nối máy chủ — đang thử nối lại…'); });
@@ -65,6 +65,8 @@
     sock.on('p:s', onState); sock.on('p:sh', onShot); sock.on('p:pk', onPk); sock.on('p:cast', onCast);
     sock.on('p:hit', d => applyHit(d.from, d.d)); sock.on('p:st', onSt); sock.on('p:kill', onKill);
     sock.on('chat', onChat); sock.on('ally:ask', onAsk);
+    sock.on('b:own', onOwn); sock.on('b:snap', onSnap); sock.on('b:hit', onBossHit); sock.on('b:atk', onBossAtk);
+    sock.on('b:sh', onBossSh); sock.on('b:spawn', onBossSpawn); sock.on('b:dead', onBossDead);
   }
   function rejoin() {
     sock.emit('room:join', { code: lastRoom.code, password: lastRoom.pass }, r => {
@@ -91,7 +93,8 @@
     if (g) { if (lock === g) lock = null; F = F.filter(f => f !== g); }
   }
   function leaveLocal() {
-    N.room = null; N.pvp = false; lastRoom = null; entered = false; lock = null; reqs.clear();
+    N.room = null; N.pvp = false; lastRoom = null; entered = false; lock = null; reqs.clear(); ownerId = null; lastScn = null;
+    for (const L of [F, typeof WL !== 'undefined' ? WL : null, typeof WF !== 'undefined' ? WF : null]) if (L) for (const f of L) if (f.rb) f.rb = 0;   // rời phòng: boss thành của riêng bạn
     for (const id of [...G.keys()]) removeGhost(id);
     refreshUI(); updTgt(); updSide();
   }
@@ -108,7 +111,7 @@
     const now = performance.now(), dt = Math.max(1, (now - g.pt) / 16.67);
     if (g.scene !== d.sn) { g.x = d.x; g.y = d.y; g.vx = g.vy = 0; }
     else { g.vx = g.vx * .4 + (d.x - g.tx) / dt * .6; g.vy = g.vy * .4 + (d.y - g.ty) / dt * .6; }
-    g.pt = now; g.tx = d.x; g.ty = d.y; g.scene = d.sn; g.face = d.f < 0 ? -1 : 1;
+    g.dead = !!d.d; g.pt = now; g.tx = d.x; g.ty = d.y; g.scene = d.sn; g.face = d.f < 0 ? -1 : 1;
     if (d.h != null) g.hp = d.h; if (d.m != null) g.maxHp = d.m; if (d.c != null) g.chakra = d.c; if (d.mc != null) g.maxChakra = d.mc;
     if (d.l != null) g.lvl = d.l; if (d.s != null) g.score = d.s; if (d.k != null) g.kills = d.k;
     g.uc = d.u || '#fff'; const b = d.b | 0;
@@ -145,11 +148,13 @@
     if (G.size || N.room) syncF();
     if (!N.room) return;
     if (lock && (!G.has(lock.id) || lock.scene !== scene() || Math.hypot(lock.x - me.x, lock.y - me.y) > 2600)) { lock = null; updTgt(); }
-    if (fr % 4 === 0 && inRoom() && run && !me.dead && N.room.players.length > 1) {
+    if (inRoom() && run) { const sc = scene()[0]; if (sc !== lastScn) { lastScn = sc; sock.emit('p:scn', { s: sc }); } }
+    bossTick();
+    if (fr % 4 === 0 && inRoom() && run && N.room.players.length > 1) {
       const b = (me.buff.shield > 0 ? 1 : 0) | (me.buff.dodge > 0 ? 2 : 0) | (me.buff.ult > 0 ? 4 : 0) | (me.buff.fast > 0 ? 8 : 0);
       sock.volatile.emit('p:s', {
         x: Math.round(me.x), y: Math.round(me.y), f: me.face, h: Math.round(me.hp), m: me.maxHp, c: Math.round(me.chakra), mc: me.maxChakra,
-        l: me.lvl, s: me.score, k: me.kills, sn: scene(), b, u: me.uc, a: me.arm ? me.arm.dr || 0 : 0,
+        l: me.lvl, s: me.score, k: me.kills, sn: scene(), b, u: me.uc, a: me.arm ? me.arm.dr || 0 : 0, d: me.dead ? 1 : 0,
       });
     }
     if (fr % 6 === 0) updTgt();
@@ -200,14 +205,12 @@
     if (g && g.scene === scene()) { if (!lock) setLock(g); if (fr - lastAtk > 90) { lastAtk = fr; txt(me.x, me.y - 64, '⚔ ' + g.name, '#ff8a80'); } }
     if (me.hp <= 0) { N.pk = from; kill(me, null); N.pk = null; }
   }
-  N.died = function () {                         // chết do người chơi -> hồi sinh, không xóa dữ liệu
-    if (!N.pk || !inRoom()) return false;
-    const from = N.pk; N.pk = null;
+  N.died = function () {                         // trả về tên người vừa hạ gục bạn (nếu là PvP); game tự hiện màn hồi sinh
+    const from = N.pk; N.pk = null; lock = null; updTgt();
+    if (!from || !inRoom()) return '';
     sock.emit('p:kill', { to: from, l: me.lvl });
     const pl = N.room.players.find(p => p.id === from);
-    respawnMe(); lock = null; updTgt();
-    banner('💀 ' + (pl ? esc(pl.name) : 'Người chơi') + ' đã hạ gục bạn — hồi sinh tại Làng');
-    return true;
+    return pl ? pl.name : 'Người chơi';
   };
   function onKill(d) {
     const pl = N.room && N.room.players.find(p => p.id === d.from), l = d.l || 1;
@@ -216,6 +219,101 @@
   }
   function onSt() { if (run && me && !me.dead) me.buff.slow = Math.max(me.buff.slow || 0, 150); }
   N.st = t => { if (!inRoom() || fr - (t.lst || -99) < 20) return; t.lst = fr; sock.emit('p:st', { to: t.id, fx: 'slow' }); };
+
+
+  /* ------------------------------ BOSS DÙNG CHUNG ------------------------------
+   * Mỗi phòng có 1 "chủ boss" (người đang ở Thế giới, do máy chủ chọn) chạy AI + sinh boss + gửi ảnh chụp ~7 lần/giây.
+   * Người khác thấy boss "ma" (rb), đánh boss = gửi sát thương cho chủ. Đạn/đòn của boss: mỗi máy tự mô phỏng, nạn nhân tự nhận sát thương.
+   * Chủ rời Thế giới / thoát -> máy chủ chọn người khác, nhận nguyên boss từ ảnh chụp cuối. */
+  N.own = () => !inRoom() || ownerId === myId;
+  const worldList = () => (dg ? (typeof WF !== 'undefined' ? WF : null) : lobby ? (typeof WL !== 'undefined' ? WL : null) : F);
+  const isRB = f => f.boss && !f.dgb && !f.dgx;
+  const BSTUB = { boss: 1, dmgM: 1, buff: {}, name: 'Boss', x: 0, y: 0, mob: 0, remote: 0 };
+  function mkBoss(o, rb) {
+    const b = mk(typeof SPR !== 'undefined' && SPR[o.ch] ? o.ch : 'Naruto', o.x, o.y, 1, o.n || 'Boss');
+    Object.assign(b, { bid: o.i, boss: 1, rb: rb ? 1 : 0, bi: o.bi | 0, wb: o.wb ? 1 : 0, r: o.r || 34, hp: o.h, maxHp: o.m, dmgM: 1, bdr: .15, bk: o.k || 1, uc: o.uc || '#fff', wl: o.wl || 0, t0: 0, tx: o.x, ty: o.y, face: o.f || 1, pt: performance.now() });
+    return b;
+  }
+  const bossById = id => { for (const f of F) if (f.boss && f.bid === id) return f; return null; };
+  function onOwn(d) {
+    const was = ownerId, w = worldList();
+    ownerId = d.id || null;
+    if (!w) return;
+    if (ownerId === myId && was !== myId) {                    // tôi thành chủ boss: nhận boss từ ảnh chụp cuối của máy chủ
+      const list = d.bosses || [], keep = new Set(list.map(b => b.i));
+      for (let i = w.length - 1; i >= 0; i--) { const f = w[i]; if (isRB(f) && !keep.has(f.bid)) w.splice(i, 1); }
+      for (const o of list) {
+        const f = w.find(x => x.boss && x.bid === o.i);
+        if (f) { f.rb = 0; f.hp = Math.min(f.hp, o.h) || o.h; } else w.push(mkBoss(o, 0));
+      }
+      if (run && list.length) banner('👑 Bạn là chủ trận boss — boss đang chạy trên máy bạn');
+    } else if (ownerId !== myId && ownerId) {                  // người khác làm chủ: bỏ boss thật cũ của mình, chờ ảnh chụp
+      for (let i = w.length - 1; i >= 0; i--) { const f = w[i]; if (isRB(f) && !f.rb) w.splice(i, 1); }
+    }
+  }
+  function onSnap(d) {
+    if (N.own() || lobby || dg || !d || !Array.isArray(d.l)) return;
+    const seen = new Set(), now = performance.now();
+    for (const o of d.l) {
+      seen.add(o.i);
+      let b = bossById(o.i);
+      if (!b) { F.push(mkBoss(o, 1)); continue; }
+      if (!b.rb) continue;
+      b.tx = o.x; b.ty = o.y; b.hp = o.h; b.maxHp = o.m; b.face = o.f < 0 ? -1 : 1; b.wl = o.wl; b.pt = now;
+    }
+    for (let i = F.length - 1; i >= 0; i--) { const f = F[i]; if (isRB(f) && !seen.has(f.bid)) F.splice(i, 1); }
+  }
+  N.stepBoss = function (f) {                                 // boss ma: nội suy theo ảnh chụp
+    const dx = f.tx - f.x, dy = f.ty - f.y;
+    if (Math.abs(dx) + Math.abs(dy) > 900) { f.x = f.tx; f.y = f.ty; } else { f.x += dx * .3; f.y += dy * .3; }
+    if (Math.hypot(dx, dy) > 2) f.anim += .12;
+    if (f.hf > 0) f.hf--;
+    if (performance.now() - f.pt > 4000) f.dead = true;       // mất tín hiệu từ chủ boss
+  };
+  function bossTick() {
+    if (!inRoom() || !N.own() || N.room.players.length < 2 || lobby || dg) { bsh.clear(); return; }
+    if (bsh.size) {
+      for (const [id, l] of bsh) if (l.length) sock.volatile.emit('b:sh', { i: id, l: l.slice(0, 40) });
+      bsh.clear();
+    }
+    if (fr % 8 !== 0) return;
+    const l = [];
+    for (const f of F) if (isRB(f) && !f.rb && !f.dead) l.push({ i: f.bid, x: f.x | 0, y: f.y | 0, h: Math.ceil(f.hp), m: f.maxHp, f: f.face, bi: f.bi, wb: f.wb ? 1 : 0, ch: f.char, n: f.name, uc: f.uc, r: f.r, k: f.bk, wl: f.wl || 0 });
+    if (l.length || snapN) { sock.volatile.emit('b:snap', { l }); snapN = l.length; }
+  }
+  N.bossSh = function (f, q) {
+    if (!inRoom() || !N.own() || N.room.players.length < 2 || !f.bid) return;
+    let l = bsh.get(f.bid); if (!l) bsh.set(f.bid, l = []);
+    if (l.length < 40) l.push({ x: q.x | 0, y: q.y | 0, vx: +q.vx.toFixed(2), vy: +q.vy.toFixed(2), d: q.dmg, c: q.col, s: q.size, l: q.life, a: +(q.a || 0).toFixed(2) });
+  };
+  function onBossSh(d) {
+    if (N.own() || !run || lobby || dg || !d || !Array.isArray(d.l)) return;
+    const src = bossById(d.i) || BSTUB;
+    for (const q of d.l) { if (PJ.length > 1100) break; PJ.push({ x: q.x, y: q.y, vx: q.vx, vy: q.vy, o: src, dmg: q.d, col: q.c, size: q.s, life: q.l, hit: new Set(), a: q.a, nt: 1 }); }
+  }
+  N.bossHit = function (t, a) { if (inRoom() && t.bid) sock.volatile.emit('b:hit', { i: t.bid, d: a }); };
+  function onBossHit(d) { if (!N.own() || lobby || dg) return; const b = bossById(d.i); if (b && !b.rb) bossRemoteHit(b, d.d, d.from); }
+  N.bossAtk = function (f, t, d) { if (inRoom() && t.id) sock.emit('b:atk', { to: t.id, i: f.bid, d }); };
+  function onBossAtk(d) {
+    if (!run || !me || me.dead || lobby || dg) return;
+    dmg(me, d.d, bossById(d.i) || BSTUB);
+  }
+  N.bossSpawn = function (n, z, wb) { if (inRoom()) sock.emit('b:spawn', { n, z, wb }); };
+  function onBossSpawn(d) {
+    if (!run || lobby || dg) return;
+    banner((d.wb ? '⚠ WORLD BOSS ' : '☠ ') + esc(d.n) + ' xuất hiện tại ' + esc(d.z) + '!'); beep(d.wb ? 80 : 120, .5, 'sawtooth');
+  }
+  N.bossDied = function (t) {
+    if (!inRoom() || !t.bid) return;
+    sock.emit('b:dead', { i: t.bid, x: t.x | 0, y: t.y | 0, wb: t.wb ? 1 : 0, bi: t.bi | 0, uc: t.uc, n: t.name, ct: Object.keys(t.ct || {}) });
+  };
+  function onBossDead(d) {
+    const g = bossById(d.i);
+    if (g) g.dead = true;
+    if (!run || !me || lobby || dg) return;
+    bossDeadRemote({ x: d.x, y: d.y, wb: d.wb, bi: d.bi, uc: d.uc, bid: d.i }, !!(g && g.mine) || (d.ct || []).includes(myId));
+  }
+  function bossList() { return F.filter(f => isRB(f) && !f.dead).sort((a, b) => Math.hypot(a.x - me.x, a.y - me.y) - Math.hypot(b.x - me.x, b.y - me.y)); }
 
   /* ------------------------------ khóa mục tiêu ------------------------------ */
   function cands() {
@@ -273,7 +371,7 @@
     X.restore();
   };
   addEventListener('mousedown', e => {           // click vào người chơi khác để khóa
-    if (e.button || !run || !me || !G.size || e.target.closest('#bar,#inv,#ib,#dlg,#set,#sb,#ob,#netp,#chatin,#party,#reqs,#mainmenu,#start,#auth')) return;
+    if (e.button || !run || !me || !G.size || e.target.closest('#bar,#inv,#ib,#dlg,#set,#sb,#ob,#netp,#chatin,#party,#reqs,#mainmenu,#start,#auth,#pm,#rsp,#cf,#lo,#ld')) return;
     const wx = e.clientX / ZE + cam.x, wy = e.clientY / ZE + cam.y, sc = scene();
     let best = null, bd = 46;
     for (const g of G.values()) if (g.scene === sc) { const d = Math.hypot(g.x - wx, g.y - 8 - wy); if (d < bd) { bd = d; best = g; } }
@@ -290,7 +388,7 @@
     '/w <tên> <tin> — nhắn riêng (/r <tin> trả lời) · /a <tin> — chat đồng minh · /me <hành động>',
     '/ally <tên> — kết đồng minh · /unally <tên> — hủy · /allies — danh sách · /who — người trong phòng',
     '/lock <tên> — khóa mục tiêu · /unlock · /tp <tên> — dịch chuyển tới · /pvp on|off — (chủ phòng)',
-    '/code — mã phòng · /leave — rời phòng · /clear — xóa chat',
+    '/boss — danh sách boss (/boss tp: tới boss gần nhất) · /code — mã phòng · /leave — rời phòng · /clear — xóa chat',
     '💬 Nói nhanh: /' + Object.keys(QUICK).join(' /'),
   ];
   const sysLine = t => addLine({ k: 's', t, ts: Date.now() });
@@ -358,6 +456,13 @@
         if (!need()) break; if (!arg) { sysLine('PvP hiện đang ' + (N.pvp ? 'BẬT' : 'TẮT') + '.'); break; }
         if (N.room.host !== myId) { sysLine('Chỉ chủ phòng mới bật/tắt được PvP.'); break; }
         sock.emit('room:set', { pvp: /^(on|bat|bật|1|true)$/i.test(arg) }); break;
+      }
+      case 'boss': {
+        if (lobby || dg) { sysLine('Lệnh /boss chỉ dùng ở Thế giới mở.'); break; }
+        const L = bossList(); if (!L.length) { sysLine('Hiện chưa có boss nào trong thế giới.'); break; }
+        if (/^tp$/i.test(arg.split(/\s+/)[0] || '')) { const b = L[0]; me.x = b.x + 300; me.y = b.y; sysLine('➡ Đã dịch chuyển tới ' + b.name); break; }
+        L.forEach(b => sysLine(`${b.wb ? '🌍' : '👹'} ${b.name} — ${Math.round(b.hp / b.maxHp * 100)}% máu · cách ${Math.round(Math.hypot(b.x - me.x, b.y - me.y) / 10)}m`));
+        sysLine('Gõ /boss tp để dịch chuyển tới boss gần nhất. Mọi người trong phòng cùng đánh chung boss.'); break;
       }
       case 'code': sysLine(N.room ? 'Mã phòng: ' + N.room.code : 'Bạn chưa ở trong phòng.'); break;
       case 'leave': NETUI.leave(); break;
@@ -563,7 +668,7 @@
         <button onclick="NETUI.assist()">🎯 Tự ngắm: ${N.assist ? 'BẬT' : 'TẮT'}</button>
         <button onclick="NETUI.help()">📖 Lệnh chat</button>
        </div>
-       <div class="sub" style="text-align:left">Tab: khóa/đổi mục tiêu · Q: bỏ khóa · Enter: chat · /help: danh sách lệnh · Click vào người chơi để khóa. Khu xanh giữa bản đồ là vùng an toàn (không PvP). Quái & boss là riêng của từng người; người chơi, đạn và kỹ năng được đồng bộ.</div>
+       <div class="sub" style="text-align:left">Tab: khóa/đổi mục tiêu · Q: bỏ khóa · Enter: chat · /help: danh sách lệnh · Click vào người chơi để khóa. Khu xanh giữa bản đồ là vùng an toàn (không PvP). Boss & World Boss là CHUNG cho cả phòng (/boss để xem vị trí); quái thường là riêng của từng người.</div>
        <div class="rw" style="gap:8px"><button class="x" onclick="NETUI.leave()">RỜI PHÒNG</button><button onclick="NETUI.toMenu()">🏠 LƯU & VỀ MENU</button></div>`;
     }
     if (!force && h === lastNet) return; lastNet = h; b.innerHTML = h;
@@ -616,10 +721,10 @@
   /* ------------------------------ tự lưu ------------------------------ */
   let asOn = false;
   function flush() {
-    if (!run || !me || me.dead) return;
+    if (!run || !me) return;
     try {
       const d = N.mkData(); lsSet(lsKey(), JSON.stringify(d));
-      if (currentAccount && !guest) {
+      if (currentAccount && !guest && !(typeof SYNC !== 'undefined' && SYNC.block)) {   // chưa tải được dữ liệu máy chủ -> không ghi đè
         const body = JSON.stringify({ token: N.tok(), character: me.char, data: d });
         if (navigator.sendBeacon) navigator.sendBeacon(API_BASE + '/api/save-beacon', new Blob([body], { type: 'text/plain' }));
         else save();
@@ -628,7 +733,7 @@
   }
   function startAutosave() {
     if (asOn) return; asOn = true;
-    setInterval(() => { if (run && me && !me.dead) save(); }, 20000);
+    setInterval(() => { if (run && me) save(); }, 20000);
     document.addEventListener('visibilitychange', () => { if (document.hidden) flush(); });
     addEventListener('pagehide', flush);
     addEventListener('beforeunload', flush);
