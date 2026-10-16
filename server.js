@@ -236,19 +236,31 @@ function attachRealtime(io, store) {
     host: (r.players.get(r.host) || {}).name || '',
   }));
 
+  // chủ mô phỏng boss: một người đang ở Thế giới (W); mất thì chuyển sang người khác
+  function elect(r) {
+    const cur = r.owner && r.players.get(r.owner);
+    if (cur && cur.scn === 'W') return;
+    let nid = null;
+    for (const p of r.players.values()) if (p.scn === 'W') { nid = p.id; break; }
+    if (nid === r.owner) return;
+    r.owner = nid;
+    if (nid) io.to(r.code).emit('b:own', { id: nid, bosses: r.bosses });
+    else r.bosses = [];
+  }
   function leave(socket, why) {
     const code = socket.data.room; if (!code) return;
     socket.data.room = null; socket.leave(code);
     const r = rooms.get(code); if (!r) return;
     const p = r.players.get(socket.id); r.players.delete(socket.id);
     if (!r.players.size) { rooms.delete(code); return; }
+    if (r.owner === socket.id) { r.owner = null; elect(r); }
     if (r.host === socket.id) r.host = r.players.keys().next().value;
     if (p) sys(r, `${p.name} ${why || 'đã rời phòng'}.`);
     pushRoom(r);
   }
   function join(socket, r) {
     leave(socket);
-    r.players.set(socket.id, { id: socket.id, name: socket.data.name, ch: null, lvl: 1 });
+    r.players.set(socket.id, { id: socket.id, name: socket.data.name, ch: null, lvl: 1, scn: null });
     socket.data.room = r.code; socket.join(r.code);
     sys(r, `${socket.data.name} đã vào phòng.`);
     pushRoom(r);
@@ -294,7 +306,7 @@ function attachRealtime(io, store) {
       const r = {
         code, name: clean(d.name, 24) || `Phòng của ${S.name}`, pass: clean(d.password, 16),
         max: Math.round(num(d.max, 2, 8) || 4), pvp: !!d.pvp, pub: d.pub !== false,
-        host: socket.id, players: new Map(), allies: new Map(), created: Date.now(),
+        host: socket.id, players: new Map(), allies: new Map(), created: Date.now(), owner: null, bosses: [],
       };
       rooms.set(code, r); join(socket, r);
       ack({ ok: true, room: view(r), you: socket.id });
@@ -342,7 +354,7 @@ function attachRealtime(io, store) {
       const p = r.players.get(socket.id); if (p && d.l) p.lvl = Math.round(num(d.l, 1, 99) || p.lvl);
       socket.to(r.code).volatile.emit('p:s', {
         id: socket.id, x, y, f: d.f < 0 ? -1 : 1, h: num(d.h, 0, 1e6), m: num(d.m, 1, 1e6), c: num(d.c, 0, 1e6), mc: num(d.mc, 1, 1e6),
-        l: num(d.l, 1, 99), s: num(d.s, 0, 1e9), k: num(d.k, 0, 1e7), sn: clean(d.sn, 24), b: num(d.b, 0, 15), u: clean(d.u, 9), a: num(d.a, 0, 1),
+        l: num(d.l, 1, 99), s: num(d.s, 0, 1e9), k: num(d.k, 0, 1e7), sn: clean(d.sn, 24), b: num(d.b, 0, 15), u: clean(d.u, 9), a: num(d.a, 0, 1), d: d.d ? 1 : 0,
       });
     });
     socket.on('p:sh', d => {
@@ -395,6 +407,65 @@ function attachRealtime(io, store) {
       const killer = r.players.get(lh.from); if (!killer) return;
       io.to(killer.id).emit('p:kill', { from: socket.id, l: num(d.l, 1, 99) || 1 });
       sys(r, `⚔ ${killer.name} đã hạ gục ${S.name}!`);
+    });
+
+    /* ---- BOSS DÙNG CHUNG: chủ phòng mô phỏng (owner) phát snapshot; người khác gửi sát thương về owner ---- */
+    socket.on('p:scn', d => {
+      const r = myRoom(); if (!r || !d) return;
+      const p = r.players.get(socket.id); if (!p) return;
+      p.scn = ['L', 'W', 'R'].includes(String(d.s)[0]) ? String(d.s)[0] : null;
+      elect(r);
+      if (p.scn === 'W' && r.owner && r.owner !== socket.id) socket.emit('b:own', { id: r.owner, bosses: [] });   // người mới vào Thế giới biết ai là chủ boss
+    });
+    const isOwner = r => r.owner === socket.id;
+    socket.on('b:snap', d => {
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !Array.isArray(d.l) || !allow(socket, 'bsnap', 14, 20)) return;
+      const l = [];
+      for (const b of d.l.slice(0, 8)) {
+        if (!b) continue;
+        const x = num(b.x, -1e5, 1e5), y = num(b.y, -1e5, 1e5), h = num(b.h, 0, 1e9), m = num(b.m, 1, 1e9);
+        if ([x, y, h, m].includes(null)) continue;
+        l.push({ i: clean(b.i, 12), x: Math.round(x), y: Math.round(y), h: Math.round(h), m: Math.round(m), f: b.f < 0 ? -1 : 1, bi: num(b.bi, 0, 40) | 0,
+          wb: b.wb ? 1 : 0, ch: clean(b.ch, 16), n: clean(b.n, 40), uc: clean(b.uc, 9), r: num(b.r, 10, 120) || 34, k: num(b.k, 1, 9) || 1, wl: num(b.wl, 0, 1e6) || 0 });
+      }
+      r.bosses = l;
+      socket.to(r.code).volatile.emit('b:snap', { l });
+    });
+    socket.on('b:hit', d => {                       // người không phải owner đánh boss -> chuyển cho owner
+      const r = myRoom(); if (!r || !d || !r.owner || isOwner(r) || !allow(socket, 'bhit', 30, 40)) return;
+      const dm = num(d.d, 1, 3000); if (dm === null) return;
+      const w = (S.bw = S.bw || { t: 0, n: 0 }), now = Date.now();
+      if (now - w.t > 1000) { w.t = now; w.n = 0; }
+      if ((w.n += dm) > 9000) return;
+      io.to(r.owner).emit('b:hit', { from: socket.id, i: clean(d.i, 12), d: Math.round(dm) });
+    });
+    socket.on('b:atk', d => {                       // owner -> nạn nhân: đòn cận chiến của boss (nạn nhân tự áp dụng)
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !allow(socket, 'batk', 20, 30)) return;
+      const t = inRoomWith(r, d.to); if (!t) return;
+      const dm = num(d.d, 1, 200); if (dm === null) return;
+      t.emit('b:atk', { i: clean(d.i, 12), d: Math.round(dm) });
+    });
+    socket.on('b:sh', d => {                        // owner phát đạn boss: mỗi người tự mô phỏng đạn trên máy mình (nạn nhân tự tính trúng)
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !Array.isArray(d.l) || !allow(socket, 'bsh', 30, 60)) return;
+      const l = [];
+      for (const q of d.l.slice(0, 40)) {
+        if (!q) continue;
+        const x = num(q.x, -1e5, 1e5), y = num(q.y, -1e5, 1e5), vx = num(q.vx, -40, 40), vy = num(q.vy, -40, 40);
+        if ([x, y, vx, vy].includes(null)) continue;
+        l.push({ x: Math.round(x), y: Math.round(y), vx: +vx.toFixed(2), vy: +vy.toFixed(2), d: num(q.d, 1, 200) || 4, c: clean(q.c, 9), s: num(q.s, 2, 20) || 6, l: num(q.l, 1, 600) || 200, a: num(q.a, -7, 7) || 0 });
+      }
+      if (l.length) socket.to(r.code).emit('b:sh', { i: clean(d.i, 12), l });
+    });
+    socket.on('b:spawn', d => {                     // owner báo boss mới (để mọi người thấy banner)
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !allow(socket, 'bsp', 2, 4)) return;
+      socket.to(r.code).emit('b:spawn', { n: clean(d.n, 40), z: clean(d.z, 40), wb: d.wb ? 1 : 0 });
+    });
+    socket.on('b:dead', d => {                      // owner báo boss chết: mỗi người tự nhận rương/XP nếu đã đánh hoặc ở gần
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !allow(socket, 'bdd', 3, 6)) return;
+      const x = num(d.x, -1e5, 1e5), y = num(d.y, -1e5, 1e5); if (x === null || y === null) return;
+      const ct = (Array.isArray(d.ct) ? d.ct : []).slice(0, 8).map(v => clean(v, 40));
+      socket.to(r.code).emit('b:dead', { i: clean(d.i, 12), x, y, wb: d.wb ? 1 : 0, bi: num(d.bi, 0, 40) | 0, uc: clean(d.uc, 9), n: clean(d.n, 40), ct });
+      r.bosses = r.bosses.filter(b => b.i !== clean(d.i, 12));
     });
 
     /* ---- chat: phòng / đồng minh / nhắn riêng ---- */
