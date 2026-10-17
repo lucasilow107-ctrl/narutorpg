@@ -306,7 +306,7 @@ function attachRealtime(io, store) {
       const r = {
         code, name: clean(d.name, 24) || `Phòng của ${S.name}`, pass: clean(d.password, 16),
         max: Math.round(num(d.max, 2, 8) || 4), pvp: !!d.pvp, pub: d.pub !== false,
-        host: socket.id, players: new Map(), allies: new Map(), created: Date.now(), owner: null, bosses: [],
+        host: socket.id, players: new Map(), allies: new Map(), created: Date.now(), owner: null, bosses: [], mdefs: new Map(),
       };
       rooms.set(code, r); join(socket, r);
       ack({ ok: true, room: view(r), you: socket.id });
@@ -351,7 +351,7 @@ function attachRealtime(io, store) {
     socket.on('p:s', d => {
       const r = myRoom(); if (!r || !d || r.players.size < 2 || !allow(socket, 's', 40, 40)) return;
       const x = num(d.x, -1e5, 1e5), y = num(d.y, -1e5, 1e5); if (x === null || y === null) return;
-      const p = r.players.get(socket.id); if (p && d.l) p.lvl = Math.round(num(d.l, 1, 99) || p.lvl);
+      const p = r.players.get(socket.id); if (p) { if (d.l) p.lvl = Math.round(num(d.l, 1, 99) || p.lvl); p.px = x; p.py = y; }
       socket.to(r.code).volatile.emit('p:s', {
         id: socket.id, x, y, f: d.f < 0 ? -1 : 1, h: num(d.h, 0, 1e6), m: num(d.m, 1, 1e6), c: num(d.c, 0, 1e6), mc: num(d.mc, 1, 1e6),
         l: num(d.l, 1, 99), s: num(d.s, 0, 1e9), k: num(d.k, 0, 1e7), sn: clean(d.sn, 24), b: num(d.b, 0, 15), u: clean(d.u, 9), a: num(d.a, 0, 1), d: d.d ? 1 : 0,
@@ -380,6 +380,83 @@ function attachRealtime(io, store) {
       const o = { id: socket.id, t: num(d.t, 0, 9), sn: clean(d.sn, 24), col: clean(d.col, 9) };
       for (const k of ['x', 'y', 'a', 'b']) { const v = num(d[k], -1e5, 1e5); if (v !== null) o[k] = v; }
       socket.to(r.code).volatile.emit('p:fx', o);
+    });
+
+
+    /* ---- QUÁI / KẺ ĐỊCH DÙNG CHUNG: chủ phòng mô phỏng, snapshot lọc theo khoảng cách người nhận ---- */
+    const near = (p, x, y, R) => p.px != null && Math.hypot(p.px - x, p.py - y) < R;
+    const wPlayers = (r, exceptId) => [...r.players.values()].filter(p => p.id !== exceptId && p.scn === 'W');
+    socket.on('m:def', d => {
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !Array.isArray(d.l) || !allow(socket, 'mdef', 20, 30)) return;
+      const l = [], now = Date.now();
+      for (const o of d.l.slice(0, 80)) {
+        if (!o) continue;
+        const e = { i: clean(o.i, 12), k: o.k === 'b' ? 'b' : 'm', z: num(o.z, 0, 40) | 0, di: num(o.di, 0, 40) | 0, el: o.el ? 1 : 0, ch: clean(o.ch, 16), n: clean(o.n, 24), lv: num(o.lv, 0, 99) | 0, mh: num(o.mh, 1, 1e6) || 100, t: num(o.t, 0, 20) | 0 };
+        if (!e.i) continue;
+        r.mdefs.set(e.i, Object.assign(e, { ts: now })); l.push(e);
+      }
+      if (r.mdefs.size > 3000) for (const k of [...r.mdefs.keys()].slice(0, 500)) r.mdefs.delete(k);
+      if (l.length) for (const p of wPlayers(r, socket.id)) io.to(p.id).emit('m:def', { l });
+    });
+    socket.on('m:need', d => {
+      const r = myRoom(); if (!r || !d || !Array.isArray(d.l) || !allow(socket, 'mneed', 6, 10)) return;
+      const l = []; for (const id of d.l.slice(0, 60)) { const e = r.mdefs.get(clean(id, 12)); if (e) l.push(e); }
+      if (l.length) socket.emit('m:def', { l });
+    });
+    socket.on('m:snap', d => {
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !Array.isArray(d.l) || !allow(socket, 'msnap', 14, 20)) return;
+      const rows = [];
+      for (const q of d.l.slice(0, 700)) {
+        if (!Array.isArray(q)) continue;
+        const x = num(q[1], -1e5, 1e5), y = num(q[2], -1e5, 1e5), h = num(q[3], 0, 1e7);
+        if ([x, y, h].includes(null)) continue;
+        rows.push([clean(q[0], 12), Math.round(x), Math.round(y), Math.round(h), q[4] < 0 ? -1 : 1]);
+      }
+      const seen = new Set(rows.map(q => q[0])), now = Date.now();
+      for (const [k, e] of r.mdefs) if (!seen.has(k) && now - e.ts > 6000) r.mdefs.delete(k);
+      for (const p of wPlayers(r, socket.id)) {
+        if (p.px == null) continue;
+        const l = rows.filter(q => near(p, q[1], q[2], 3000));
+        io.to(p.id).volatile.emit('m:snap', { l });
+      }
+    });
+    socket.on('m:hit', d => {                                   // người khác đánh quái -> gửi cho chủ phòng
+      const r = myRoom(); if (!r || !d || !r.owner || r.owner === socket.id || !Array.isArray(d.l) || !allow(socket, 'mhit', 20, 30)) return;
+      const l = [], now = Date.now(), w = (S.mw = S.mw || { t: now, n: 0 });
+      if (now - w.t > 1000) { w.t = now; w.n = 0; }
+      for (const q of d.l.slice(0, 40)) {
+        if (!Array.isArray(q)) continue;
+        const dm = num(q[1], 1, 1500); if (dm === null) continue;
+        if ((w.n += dm) > 12000) break;
+        l.push([clean(q[0], 12), Math.round(dm)]);
+      }
+      if (l.length) io.to(r.owner).emit('m:hit', { from: socket.id, l });
+    });
+    socket.on('m:fx', d => {
+      const r = myRoom(); if (!r || !d || !r.owner || r.owner === socket.id || !allow(socket, 'mfx', 10, 20)) return;
+      io.to(r.owner).emit('m:fx', { i: clean(d.i, 12), k: clean(d.k, 8) });
+    });
+    socket.on('m:atk', d => {                                   // chủ phòng -> nạn nhân: đòn cận chiến của quái
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !allow(socket, 'matk', 60, 80)) return;
+      const t = inRoomWith(r, d.to); if (!t || t.id === socket.id) return;
+      t.emit('m:atk', { i: clean(d.i, 12), d: Math.round(num(d.d, 1, 300) || 5) });
+    });
+    socket.on('m:sh', d => {                                    // đạn của quái/kẻ địch
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !Array.isArray(d.l) || !allow(socket, 'msh', 40, 80)) return;
+      const l = [];
+      for (const q of d.l.slice(0, 60)) {
+        if (!Array.isArray(q)) continue;
+        const v = [num(q[0], -1e5, 1e5), num(q[1], -1e5, 1e5), num(q[2], -60, 60), num(q[3], -60, 60), num(q[4], 1, 200), num(q[5], 1, 30), num(q[6], 1, 600)];
+        if (v.includes(null)) continue;
+        l.push(v.map(n => Math.round(n * 100) / 100).concat([clean(q[7], 9), num(q[8], 0, 9) | 0, num(q[9], 0, 200) || 0, num(q[10], 0, 2) || 0, num(q[11], -7, 7) || 0, num(q[12], 0, 9) | 0]));
+      }
+      if (!l.length) return;
+      for (const p of wPlayers(r, socket.id)) if (near(p, l[0][0], l[0][1], 2600)) io.to(p.id).volatile.emit('m:sh', { i: clean(d.i, 12), l });
+    });
+    socket.on('m:dead', d => {                                  // chủ phòng báo người hạ gục quái để chia thưởng
+      const r = myRoom(); if (!r || !d || !isOwner(r) || !allow(socket, 'mdead', 30, 60)) return;
+      const t = inRoomWith(r, d.to); if (!t || t.id === socket.id) return;
+      t.emit('m:dead', { i: clean(d.i, 12), x: num(d.x, -1e5, 1e5), y: num(d.y, -1e5, 1e5), k: d.k === 'b' ? 'b' : 'm', t: num(d.t, 0, 20) | 0, el: d.el ? 1 : 0, lv: num(d.lv, 0, 99) | 0 });
     });
 
     /* ---- PvP: người tấn công tính sát thương, nạn nhân áp dụng; đồng minh không đánh nhau ---- */
