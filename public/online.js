@@ -15,7 +15,7 @@
   const reqs = new Map();               // id -> {name, ts}: lời mời đồng minh đang chờ
   const chatLog = [], hist = [];
   let sock = null, myId = null, myNick = '', lastRoom = null, entered = false, lock = null, view = 'main',
-      netpOpen = false, ioTries = 0, lastWhisper = '', sidc = 0, lastScn = null, ownerId = null, snapN = 0, bsh = new Map(), hi = -1, soloHinted = false, lastNet = '', lastSide = '';
+      netpOpen = false, ioTries = 0, lastWhisper = '', sidc = 0, lastScn = null, ownerId = null, snapN = 0, bsh = new Map(), GE = new Map(), MD = new Map(), announced = new Set(), needQ = new Set(), hitQ = new Map(), mshQ = [], lastNeed = 0, hi = -1, soloHinted = false, lastNet = '', lastSide = '';
   const $q = id => document.getElementById(id);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } };
@@ -67,6 +67,7 @@
     sock.on('chat', onChat); sock.on('ally:ask', onAsk);
     sock.on('b:own', onOwn); sock.on('b:snap', onSnap); sock.on('b:hit', onBossHit); sock.on('b:atk', onBossAtk);
     sock.on('b:sh', onBossSh); sock.on('b:spawn', onBossSpawn); sock.on('b:dead', onBossDead);
+    sock.on('m:def', onMDef); sock.on('m:snap', onMSnap); sock.on('m:hit', onMHit); sock.on('m:atk', onMAtk); sock.on('m:sh', onMSh); sock.on('m:dead', onMDead);
   }
   function rejoin() {
     sock.emit('room:join', { code: lastRoom.code, password: lastRoom.pass }, r => {
@@ -93,7 +94,7 @@
     if (g) { if (lock === g) lock = null; F = F.filter(f => f !== g); }
   }
   function leaveLocal() {
-    N.room = null; N.pvp = false; lastRoom = null; entered = false; lock = null; reqs.clear(); ownerId = null; lastScn = null;
+    N.room = null; N.pvp = false; lastRoom = null; entered = false; lock = null; reqs.clear(); ownerId = null; lastScn = null; GE.clear(); announced.clear();
     for (const L of [F, typeof WL !== 'undefined' ? WL : null, typeof WF !== 'undefined' ? WF : null]) if (L) for (const f of L) if (f.rb) f.rb = 0;   // rời phòng: boss thành của riêng bạn
     for (const id of [...G.keys()]) removeGhost(id);
     refreshUI(); updTgt(); updSide();
@@ -149,7 +150,7 @@
     if (!N.room) return;
     if (lock && (!G.has(lock.id) || lock.scene !== scene() || Math.hypot(lock.x - me.x, lock.y - me.y) > 2600)) { lock = null; updTgt(); }
     if (inRoom() && run) { const sc = scene()[0]; if (sc !== lastScn) { lastScn = sc; sock.emit('p:scn', { s: sc }); } }
-    bossTick();
+    bossTick(); mobTick(); if (fr % 4 === 0) flushMobHits();
     if (fr % 4 === 0 && inRoom() && run && N.room.players.length > 1) {
       const b = (me.buff.shield > 0 ? 1 : 0) | (me.buff.dodge > 0 ? 2 : 0) | (me.buff.ult > 0 ? 4 : 0) | (me.buff.fast > 0 ? 8 : 0);
       sock.volatile.emit('p:s', {
@@ -227,7 +228,9 @@
    * Chủ rời Thế giới / thoát -> máy chủ chọn người khác, nhận nguyên boss từ ảnh chụp cuối. */
   N.own = () => !inRoom() || ownerId === myId;
   const worldList = () => (dg ? (typeof WF !== 'undefined' ? WF : null) : lobby ? (typeof WL !== 'undefined' ? WL : null) : F);
+  const isE = f => (f.mob || f.bot) && !f.boss;
   const isRB = f => f.boss && !f.dgb && !f.dgx;
+  const isEnt = f => (f.mob || f.bot) && f.bid && !f.dgx && !f.remote && !f.boss;
   const BSTUB = { boss: 1, dmgM: 1, buff: {}, name: 'Boss', x: 0, y: 0, mob: 0, remote: 0 };
   function mkBoss(o, rb) {
     const b = mk(typeof SPR !== 'undefined' && SPR[o.ch] ? o.ch : 'Naruto', o.x, o.y, 1, o.n || 'Boss');
@@ -246,9 +249,11 @@
         const f = w.find(x => x.boss && x.bid === o.i);
         if (f) { f.rb = 0; f.hp = Math.min(f.hp, o.h) || o.h; } else w.push(mkBoss(o, 0));
       }
-      if (run && list.length) banner('👑 Bạn là chủ trận boss — boss đang chạy trên máy bạn');
+      for (const f of w) if (isEnt(f) && f.rb) f.rb = 0;          // quái/kẻ địch ma -> thật (tiếp tục mô phỏng)
+      announced.clear();
+      if (run && list.length) banner('👑 Bạn là chủ phòng — boss & quái chạy trên máy bạn');
     } else if (ownerId !== myId && ownerId) {                  // người khác làm chủ: bỏ boss thật cũ của mình, chờ ảnh chụp
-      for (let i = w.length - 1; i >= 0; i--) { const f = w[i]; if (isRB(f) && !f.rb) w.splice(i, 1); }
+      for (let i = w.length - 1; i >= 0; i--) { const f = w[i]; if ((isRB(f) || isEnt(f)) && !f.rb) w.splice(i, 1); }
     }
   }
   function onSnap(d) {
@@ -282,6 +287,7 @@
     if (l.length || snapN) { sock.volatile.emit('b:snap', { l }); snapN = l.length; }
   }
   N.bossSh = function (f, q) {
+    if (isE(f)) return mobSh(f, q);
     if (!inRoom() || !N.own() || N.room.players.length < 2 || !f.bid) return;
     let l = bsh.get(f.bid); if (!l) bsh.set(f.bid, l = []);
     if (l.length < 40) l.push({ x: q.x | 0, y: q.y | 0, vx: +q.vx.toFixed(2), vy: +q.vy.toFixed(2), d: q.dmg, c: q.col, s: q.size, l: q.life, a: +(q.a || 0).toFixed(2) });
@@ -291,9 +297,13 @@
     const src = bossById(d.i) || BSTUB;
     for (const q of d.l) { if (PJ.length > 1100) break; PJ.push({ x: q.x, y: q.y, vx: q.vx, vy: q.vy, o: src, dmg: q.d, col: q.c, size: q.s, life: q.l, hit: new Set(), a: q.a, nt: 1 }); }
   }
-  N.bossHit = function (t, a) { if (inRoom() && t.bid) sock.volatile.emit('b:hit', { i: t.bid, d: a }); };
+  N.bossHit = function (t, a) {
+    if (!inRoom() || !t.bid) return;
+    if (isE(t)) { hitQ.set(t.bid, (hitQ.get(t.bid) || 0) + a); return; }
+    sock.volatile.emit('b:hit', { i: t.bid, d: a });
+  };
   function onBossHit(d) { if (!N.own() || lobby || dg) return; const b = bossById(d.i); if (b && !b.rb) bossRemoteHit(b, d.d, d.from); }
-  N.bossAtk = function (f, t, d) { if (inRoom() && t.id) sock.emit('b:atk', { to: t.id, i: f.bid, d }); };
+  N.bossAtk = function (f, t, d) { if (inRoom() && t.id) sock.emit(isE(f) ? 'm:atk' : 'b:atk', { to: t.id, i: f.bid, d }); };
   function onBossAtk(d) {
     if (!run || !me || me.dead || lobby || dg) return;
     dmg(me, d.d, bossById(d.i) || BSTUB);
@@ -313,6 +323,112 @@
     if (!run || !me || lobby || dg) return;
     bossDeadRemote({ x: d.x, y: d.y, wb: d.wb, bi: d.bi, uc: d.uc, bid: d.i }, !!(g && g.mine) || (d.ct || []).includes(myId));
   }
+
+  /* ------------------------------ QUÁI / KẺ ĐỊCH DÙNG CHUNG ------------------------------
+   * Chủ phòng (cùng người chạy boss) sinh & mô phỏng quái quanh MỌI người chơi trong Thế giới, gửi định nghĩa (m:def) một lần
+   * và vị trí/máu ~10 lần/giây (máy chủ lọc theo khoảng cách). Người khác thấy quái "ma"; đánh quái = gửi sát thương cho chủ.
+   * Quái tấn công: cận chiến -> m:atk, đạn -> m:sh (mỗi máy tự mô phỏng đạn, nạn nhân tự nhận sát thương).
+   * Quái chết: người đã đánh nhận thưởng (rương/XP/Ryo) trên máy mình. */
+  const MSTUB = { mob: 1, dmgM: 1, buff: {}, name: 'Quái', x: 0, y: 0, remote: 0 };
+  function mkEnt(df, x, y, h, f) {
+    let b;
+    if (df.k === 'b') {
+      b = mk(PAL[df.ch] ? df.ch : 'Naruto', x, y, 1, df.n || 'Ninja');
+      Object.assign(b, { bid: df.i, bot: 1, lvl: df.lv || 1, maxHp: df.mh, hp: h });
+    } else {
+      const M = MOBS[df.z], d = M && M[df.di]; if (!d) return null;
+      const t = d[4], el = !!df.el, sc = (2 + t * .4) * (el ? 1.25 : 1);
+      b = mk('Naruto', x, y, 1, d[0]);
+      Object.assign(b, { bid: df.i, dk: df.z * 10 + df.di, zn: df.z, sk: d[6] || '', cd2: rnd(30, 140), mob: 1, def: d, t, elite: el, lvl: t, hp: h, maxHp: df.mh, md: (5 + t * 3) * (el ? 1.4 : 1), r: Math.round(sc * 6) });
+    }
+    Object.assign(b, { rb: 1, tx: x, ty: y, pt: performance.now(), face: f < 0 ? -1 : 1 });
+    return b;
+  }
+  function onMDef(d) {
+    if (!d || !Array.isArray(d.l)) return;
+    for (const o of d.l) MD.set(o.i, o);
+    if (MD.size > 4000) for (const k of [...MD.keys()].slice(0, 1000)) MD.delete(k);
+  }
+  function onMSnap(d) {
+    if (N.own() || lobby || dg || !d || !Array.isArray(d.l)) return;
+    const seen = new Set(), now = performance.now(); let miss = null;
+    for (const q of d.l) {
+      const id = q[0]; seen.add(id);
+      let g = GE.get(id); if (g && g.dead) { GE.delete(id); g = null; }
+      if (!g) {
+        const df = MD.get(id);
+        if (!df) { (miss = miss || []).push(id); continue; }
+        g = mkEnt(df, q[1], q[2], q[3], q[4]); if (!g) continue;
+        GE.set(id, g); F.push(g);
+      }
+      g.tx = q[1]; g.ty = q[2]; g.hp = q[3]; g.face = q[4] < 0 ? -1 : 1; g.pt = now;
+    }
+    for (let i = F.length - 1; i >= 0; i--) { const f = F[i]; if (f.rb && isEnt(f) && !seen.has(f.bid)) { F.splice(i, 1); GE.delete(f.bid); } }
+    for (const id of [...GE.keys()]) if (!seen.has(id)) GE.delete(id);
+    if (miss && performance.now() - lastNeed > 400) { lastNeed = performance.now(); sock.emit('m:need', { l: miss.slice(0, 60) }); }
+  }
+  function mobTick() {                                           // chỉ chạy ở máy chủ-phòng
+    if (!inRoom() || !N.own() || N.room.players.length < 2 || lobby || dg) { announced.clear(); mshQ.length = 0; return; }
+    if (mshQ.length) {                                           // đạn quái: gom theo ô 1500px để máy chủ lọc người nhận
+      const cells = new Map();
+      for (const r of mshQ) { const k = (r[0] / 1500 | 0) + ',' + (r[1] / 1500 | 0); let c = cells.get(k); if (!c) cells.set(k, c = []); if (c.length < 60) c.push(r); }
+      for (const c of cells.values()) sock.volatile.emit('m:sh', { i: 'm', l: c });
+      mshQ.length = 0;
+    }
+    if (fr % 4 !== 0) return;
+    const rem = []; for (const g of G.values()) if (g.scene === 'W' && !g.dead) rem.push(g);
+    if (!rem.length) return;
+    const near = f => { for (const g of rem) if (Math.hypot(g.x - f.x, g.y - f.y) < 3100) return true; return false; };
+    const defs = [], rows = [], live = new Set();
+    for (const f of F) {
+      if (!isEnt(f) || f.rb || f.dead) continue;
+      live.add(f.bid);
+      if (!near(f)) continue;
+      if (!announced.has(f.bid)) {
+        announced.add(f.bid);
+        defs.push(f.mob ? { i: f.bid, k: 'm', z: f.zn, di: f.dk % 10, el: f.elite ? 1 : 0, mh: Math.round(f.maxHp), lv: f.lvl, t: f.t }
+                        : { i: f.bid, k: 'b', ch: f.char, n: f.name, lv: f.lvl, mh: Math.round(f.maxHp), el: 0 });
+      }
+      if (rows.length < 700) rows.push([f.bid, f.x | 0, f.y | 0, Math.ceil(f.hp), f.face]);
+    }
+    for (let i = 0; i < defs.length; i += 80) sock.emit('m:def', { l: defs.slice(i, i + 80) });
+    if (fr % 8 === 0) for (const id of [...announced]) if (!live.has(id)) announced.delete(id);
+    if (fr % 8 === 0 || defs.length) sock.volatile.emit('m:snap', { l: rows });   // ~7,5 lần/giây
+  }
+  function mobSh(f, q) {                                         // quái/kẻ địch bắn: chủ phòng gom đạn gửi cho người khác
+    if (!inRoom() || !N.own() || N.room.players.length < 2 || mshQ.length > 400) return;
+    mshQ.push([q.x | 0, q.y | 0, +q.vx.toFixed(2), +q.vy.toFixed(2), Math.max(1, Math.round(q.dmg)), q.size || 5, q.life || 90, q.col || '#fff', q.sh | 0, 0, q.mv | 0, +(q.ph || 0).toFixed(2), 0]);
+  }
+  function onMSh(d) {
+    if (N.own() || !run || lobby || dg || !d || !Array.isArray(d.l)) return;
+    for (const r of d.l) {
+      if (PJ.length > 1100) break;
+      PJ.push({ x: r[0], y: r[1], vx: r[2], vy: r[3], o: MSTUB, dmg: r[4], size: r[5], life: r[6], col: r[7] || '#fff', sh: r[8] | 0, mv: r[10] | 0, ph: r[11] || 0, bx: r[0], by: r[1], t: 0, hit: new Set(), a: Math.atan2(r[3], r[2]), nt: 1 });
+    }
+  }
+  function onMHit(d) {                                           // (chủ phòng) người khác đánh quái của tôi
+    if (!N.own() || lobby || dg || !d || !Array.isArray(d.l)) return;
+    for (const q of d.l) { const b = F.find(f => f.bid === q[0] && isEnt(f) && !f.rb); if (b) bossRemoteHit(b, q[1], d.from); }
+  }
+  function onMAtk(d) {
+    if (!run || !me || me.dead || lobby || dg || !d) return;
+    dmg(me, d.d, GE.get(d.i) || MSTUB);
+  }
+  N.mobDied = function (t) {                                     // (chủ phòng) quái chết: gửi thưởng cho từng người đã đánh
+    if (!inRoom() || !t.bid) return;
+    for (const id of Object.keys(t.ct || {}).slice(0, 8)) sock.emit('m:dead', { to: id, i: t.bid, x: t.x | 0, y: t.y | 0, k: t.mob ? 'm' : 'b', t: t.t | 0, el: t.elite ? 1 : 0, lv: t.lvl | 0 });
+  };
+  function onMDead(d) {
+    const df = MD.get(d.i), g = GE.get(d.i); if (g) { g.dead = true; GE.delete(d.i); }
+    if (!run || !me || lobby || dg) return;
+    entDeadRemote({ k: d.k === 'b' ? 999 : (df ? df.z * 10 + df.di : 0), x: d.x, y: d.y, el: d.el, l: d.lv }, true);
+  }
+  function flushMobHits() {                                      // gom sát thương lên quái ma, gửi ~15 lần/giây
+    if (!hitQ.size) return;
+    if (inRoom()) { const l = []; for (const [id, v] of hitQ) l.push([id, v]); sock.emit('m:hit', { l: l.slice(0, 40) }); }
+    hitQ.clear();
+  }
+
   function bossList() { return F.filter(f => isRB(f) && !f.dead).sort((a, b) => Math.hypot(a.x - me.x, a.y - me.y) - Math.hypot(b.x - me.x, b.y - me.y)); }
 
   /* ------------------------------ khóa mục tiêu ------------------------------ */
@@ -668,7 +784,7 @@
         <button onclick="NETUI.assist()">🎯 Tự ngắm: ${N.assist ? 'BẬT' : 'TẮT'}</button>
         <button onclick="NETUI.help()">📖 Lệnh chat</button>
        </div>
-       <div class="sub" style="text-align:left">Tab: khóa/đổi mục tiêu · Q: bỏ khóa · Enter: chat · /help: danh sách lệnh · Click vào người chơi để khóa. Khu xanh giữa bản đồ là vùng an toàn (không PvP). Boss & World Boss là CHUNG cho cả phòng (/boss để xem vị trí); quái thường là riêng của từng người.</div>
+       <div class="sub" style="text-align:left">Tab: khóa/đổi mục tiêu · Q: bỏ khóa · Enter: chat · /help: danh sách lệnh · Click vào người chơi để khóa. Khu xanh giữa bản đồ là vùng an toàn (không PvP). Boss, World Boss và quái thường đều CHUNG cho cả phòng (/boss để xem boss).</div>
        <div class="rw" style="gap:8px"><button class="x" onclick="NETUI.leave()">RỜI PHÒNG</button><button onclick="NETUI.toMenu()">🏠 LƯU & VỀ MENU</button></div>`;
     }
     if (!force && h === lastNet) return; lastNet = h; b.innerHTML = h;
